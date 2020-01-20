@@ -1,0 +1,293 @@
+model "Adversial_Main"
+  uses  "mmxprs", "mmjobs", "mmsystem"
+  ! uses "mminsight" ! uncomment this line for an Xpress Insight model
+
+
+
+ parameters
+	 Periods = 10			!Max number of periods
+	 Suppliers = 5			!Max number of Suppliers
+	 DataFile = "FirstTest.dat"		!Data file; extension will be added below
+	 ResultFile = "FirstResult.txt"		!Result file; extension will be added below
+	 Gamma = 10		!Max number of Suppliers
+ end-parameters
+
+ forward procedure solve_mainmodel(ct: integer)
+ forward procedure solve_worstcase(ct: integer)
+ forward procedure save_ResultFile
+ forward procedure load_DataFile
+
+ declarations
+ 	 T = 1..Periods ! number of time periods
+	  S = 1..Suppliers ! number of suppliers
+   STEP_0=2                            ! Event codes sent to submodels
+   STEP_1=3
+   STEP_2=4
+   EVENT_READY=5
+   EVENT_SOLVED=6                      ! Event codes sent by submodels
+   EVENT_INFEAS=7
+   EVENT_PRINT=8
+   o: array(S) of real	! Fixed Ordering cost of each supplier
+  	p: array(S) of real	! Unit price from each supplier
+	  Lmax: array(S) of integer	! Maximum leadtime of each supplier
+  	Lmin: array(S) of integer	! Mininum leadtime of each supplier
+  	Lmean: array(S) of integer	! for deterministic model only
+  	L: array(S) of integer		! Lead time being used (for deterministic)
+  	h: real 						! inventory holding cost
+  	b: real							! backordering penalty
+  	d: array(T) of real	! Demand in each period
+  	Imax: real						! Storage capacity
+   sol_main:real
+   sol_sub: real
+   mainmod: Model
+   submod : Model
+   Objective:linctr
+   sol_delta: array(T, T, S) of real
+   sol_Q: array(T, S) of real
+   best_Q: array(T, S) of real
+   sol_I: array(T) of real
+   sol_B: array(T) of real
+ end-declarations
+  writeln("Load data")
+	 fopen(DataFile, F_INPUT)
+	  load_DataFile
+ 	fclose(F_INPUT);
+  writeln("Begin running model")
+  !...
+
+
+
+! Compile + load all mainmodel
+ if compile("Adversarial_SupplierSelection.mos")<>0 then exit(1); end-if
+  load(mainmod, "Adversarial_SupplierSelection.bim")
+
+! Compile + load subproblem
+ if compile("Adversarial_SubProblem.mos")<>0 then exit(1); end-if
+  load(submod, "Adversarial_SubProblem.bim")
+
+ run(mainmod, "Periods="+ Periods+",Suppliers="+Suppliers+",DataFile="+DataFile+",ResultFile="+ResultFile+",Gamma="+Gamma )
+ run(submod, "Periods="+ Periods+",Suppliers="+Suppliers+",DataFile="+DataFile+",ResultFile="+ResultFile+",Gamma="+Gamma)
+
+ forall(m in 1..2) do
+  wait                                ! Wait for "Ready" messages
+  ev:= getnextevent
+  if getclass(ev) <> EVENT_READY then
+   writeln("Error occurred in a subproblem")
+   exit(4)
+  end-if
+ end-do
+
+  ct := 0
+  sol_main:=0
+  sol_sub:=99999
+
+  bestsol := 999999.0
+
+  start := currenttime
+  repeat
+    writeln("\n**** Iteration: ", ct)
+    solve_mainmodel(ct)                ! 1. Solve problem with fixed cont.
+    writeln("\n************************ MAIN MODEL SOLVED: ",sol_main )
+    solve_worstcase(ct)                        ! 2. Solve problem with fixed int.
+    writeln("\n************************ Worst case  SOLVED: ",sol_sub )
+
+
+
+   if  sol_sub < bestsol then
+     bestsol := sol_sub
+     best_Q:=sol_Q
+
+     forall( t in T, s in S) do
+	       best_Y(t,s) := 0
+	       if best_Q(t,s) >= 1 then
+		       best_Y(t,s) := 1
+	       end-if
+     end-do
+
+     initializations from "bin:shmem:solI"
+      sol_I
+     end-initializations
+
+     initializations from "bin:shmem:solB"
+      sol_B
+     end-initializations
+
+   end-if
+
+
+
+    algend := currenttime
+    algtime := (algend-start) / 1000
+    ct+=1
+  until (sol_sub <= sol_main)or(algtime>600)                !    Test for optimality
+
+  send(mainmod, EVENT_PRINT, ct)
+  wait
+  ev:=getnextevent
+  writeln("End running model")
+ fopen(ResultFile, F_OUTPUT)
+ 	writeln("========================================================")
+   save_ResultFile
+ fclose(F_OUTPUT);
+
+
+
+  !-----------------------------------------------------------
+ procedure solve_mainmodel(ct: integer)
+  send(mainmod, STEP_1, ct)        ! Start the problem solving
+  wait                                ! Wait for the solution
+  ev:=getnextevent
+  sol_main:= getvalue(ev)              ! Store objective function value
+
+  initializations from "bin:shmem:sol"  ! Retrieve the solution
+   sol_Q
+  end-initializations
+ end-procedure
+!-----------------------------------------------------------
+
+  !-----------------------------------------------------------
+ procedure solve_worstcase(ct: integer)
+  send(submod, STEP_1, ct)        ! Start the problem solving
+  wait                                ! Wait for the solution
+  ev:=getnextevent
+  sol_sub:= getvalue(ev)              ! Store objective function value
+
+  initializations from "bin:shmem:soldelta"  ! Retrieve the solution
+   sol_delta
+  end-initializations
+ end-procedure
+!-----------------------------------------------------------
+
+
+
+
+!-----------------------------------------------------------
+procedure save_ResultFile
+	write("Method \t Sol \t status \t LB \t CPU \t Gap \t Nodes \t #Setups \t")
+	writeln("Avge#S/Per \t Tot#S Used \t Max#S/Per \t AvgInventory \t InvCost \t Ordering  \t  PurchCost \t DistSuppl \t ReliabilitySuppl \t backordering")
+
+	nrsetup := 0
+	forall(t in T, s in S) do
+		if (best_Y(t,s) > 0) then
+			nrsetup := nrsetup + 1
+		end-if
+	end-do
+
+
+	periodwithsetup := 0
+	maxSupPerPeriod := 0
+	avgleadtimeousedsuppliers := 0.0
+	avgrangeusedsuppliers :=  0.0
+	forall(t in T) do
+		isperiodwithsetup := false
+		nrsupplierinperiod := 0
+		forall( s in S) do
+			if (best_Y(t,s) > 0) then
+				isperiodwithsetup := true
+				nrsupplierinperiod := nrsupplierinperiod + 1
+				avgleadtimeousedsuppliers := avgleadtimeousedsuppliers +  ((Lmax(s)  + Lmin(s) ) /2)
+				avgrangeusedsuppliers := avgrangeusedsuppliers + (Lmax(s)  - Lmin(s) )
+			end-if
+		end-do
+		if isperiodwithsetup then
+			periodwithsetup := periodwithsetup +1
+		end-if
+
+		if nrsupplierinperiod > maxSupPerPeriod then
+			maxSupPerPeriod := nrsupplierinperiod
+		end-if
+
+	end-do
+
+
+	Avgsetup := nrsetup/periodwithsetup
+	avgrangeusedsuppliers := avgrangeusedsuppliers / nrsetup
+	avgleadtimeousedsuppliers := avgleadtimeousedsuppliers / nrsetup
+
+	nrsuppliers := 0
+	forall( s in S) do
+		issupplierused := false
+		forall( t in T) do
+			if (best_Y(t,s) > 0) then
+				issupplierused := true
+			end-if
+		end-do
+		if issupplierused then
+			nrsuppliers := nrsuppliers +1
+		end-if
+	end-do
+
+	inventoryTot := sum(t in T)(sol_I(t) - sol_B(t))
+	Avginventory := inventoryTot / Periods
+	holding := sum(t in T)sol_I(t) * h
+	ordering := sum(t in T, s in S)o(s)*best_Y(t,s)
+	purchasing := sum(t in T, s in S)p(s)*best_Q(t,s)
+	backordering := sum(t in T)sol_B(t) * b
+	gap := 100*(bestsol-sol_main)/bestsol
+
+	writeln("'Adversarial ", bestsol,  " ", "?",  " ", sol_main  , " ", algtime, " ", gap, " ",  "?", " ", nrsetup, " ", Avgsetup,  " ", nrsuppliers,  " ", maxSupPerPeriod, " ", Avginventory, " ", holding, " ", ordering, " ", purchasing, " ", avgleadtimeousedsuppliers, " ", avgrangeusedsuppliers," ",  backordering, "'" )
+
+	forall(t in T, s in S) do
+		if (best_Y(t,s) > 0) then
+			writeln("t: ", t, " s: ",s," Y: ",best_Y(t,s), " Q: ", best_Q(t,s))
+		end-if
+	end-do
+
+	forall(t in T) do
+		writeln("I(",t,"): ", sol_I(t), " B(",t,"): ", sol_B(t), "   I: ", sum(tau in 1..t, s in S)best_Q(t,s)-sum(tau in 1..t)d(tau))
+	end-do
+
+	writeln("Holding: ", holding)
+	writeln("Backordering: ", backordering)
+	writeln("Ordering: ", ordering)
+
+
+end-procedure  !save result file
+
+!******************************************************************************************
+!Procedure : ******************************************************************************
+procedure load_DataFile
+	declarations
+		TempString: string
+	end-declarations
+
+	readln(TempString)
+	readln(TempString)
+	forall(s in S) do
+		if (s = Suppliers) then readln(o(s)) ! last entry in the raw, use readln
+		else read(o(s)); end-if
+	end-do
+	readln(TempString)
+	forall(s in S) do
+		if (s=Suppliers) then readln(p(s)) ! last entry in the raw, use readln
+		else read(p(s)); end-if
+	end-do
+	readln(TempString)
+	readln(h)
+	readln(TempString)
+	readln(b)
+	readln(TempString)
+	readln(Imax)
+	readln(TempString)
+	readln(TempString)
+	forall(t in T) do
+		if (t=Periods) then readln(d(t)) ! last entry in the raw, use readln
+		else read(d(t)); end-if
+	end-do
+	readln(TempString)
+	forall(s in S) do
+		if (s=Suppliers) then readln(Lmax(s)) ! last entry in the raw, use readln
+		else read(Lmax(s)); end-if
+	end-do
+	readln(TempString)
+	forall(s in S) do
+		if (s=Suppliers) then readln(Lmin(s)) ! last entry in the raw, use readln
+		else read(Lmin(s)); end-if
+	end-do
+	readln(TempString)
+
+
+end-procedure	! Load Data File
+
+
+end-model
