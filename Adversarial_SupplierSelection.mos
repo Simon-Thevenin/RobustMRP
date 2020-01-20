@@ -1,0 +1,270 @@
+(!******************************************************
+	Dyanamic Lot Sizing model with Supplier Selection and Stochastic Lead Times from Suppliers
+	V0: First implementation 22/05/2019
+   ======================
+
+*******************************************************!)
+
+model "Dynamic_LSP_Supplier_Selection_StochasticLT"
+ uses 	"mmxprs", "mmjobs"
+! ,
+! 		"mmive",
+! 		"mmsystem",
+! 		"mmjobs"
+parameters
+	Periods = 10				!Max number of periods
+	Suppliers = 10			!Max number of Suppliers
+	DataFile = "FirstTest.dat"		!Data file; extension will be added below
+	ResultFile = "FirstResult.txt"		!Result file; extension will be added below
+	Gamma = -1			!Max number of Suppliers
+end-parameters
+
+	! Declare functions and procedures here
+	!========================
+ forward procedure load_DataFile
+ forward procedure save_ResultFile
+ forward procedure screen_DisplayResults
+
+ declarations
+    STEP_0=2                            ! Event codes sent to submodels
+    STEP_1=3
+    STEP_2=4
+    EVENT_READY=5
+    EVENT_SOLVED=6                      ! Event codes sent by submodels
+    EVENT_INFEAS=7
+    EVENT_PRINT=8
+	! Input Data of the model
+	!========================
+	T = 1..Periods ! number of time periods
+	S = 1..Suppliers ! number of suppliers
+	W = 1..1 ! Scenarios
+
+	WMax = 1..1000
+
+	o: array(S) of real	! Fixed Ordering cost of each supplier
+	p: array(S) of real	! Unit price from each supplier
+	Lmax: array(S) of integer	! Maximum leadtime of each supplier
+	Lmin: array(S) of integer	! Mininum leadtime of each supplier
+	Lmean: array(S) of integer	! for deterministic model only
+	L: array(S) of integer		! Lead time being used (for deterministic)
+	delta: array(T,T,S, W) of real ! 1 if order placed to supplier s in period tau arrived in period t
+	sol_delta:array(T,T,S) of real ! 1 if order placed to supplier s in period tau arrived in period t
+	h: real 						! inventory holding cost
+	b: real							! backordering penalty
+	gamma:real          ! the budget uncertainty parameter
+	d: array(T) of real	! Demand in each period
+	Imax: real						! Storage capacity
+	BigM: real						! a very large value
+	sol_Q: array(T, S) of real
+    nr: integer
+	! Decision variables
+	!========================
+	I: array(T) of mpvar	! Inventory level at end of period t
+	Q: array(T, S) of mpvar ! Qtty ordered from
+									!supplier s in period t
+	Y: array(T, S) of mpvar ! equal 1 if an order is
+									!passed to supplier s in period t
+	c: array(T,WMax) of mpvar	! total holding or backordering cost in period t for scenario w
+	Cw: array(WMax) of mpvar	! The worst case scenario cost.
+	C: mpvar	! The worst case scenario cost.
+
+ end-declarations
+
+ 	! Loading DataFile
+	!========================
+	!DataFile := "DataSets\\"+MyDFile+".dat"
+	!DataFile := "SuperSmall.dat" !MyDFile+".dat"
+	!DataFile := "FirstTest.dat" !MyDFile+".dat"
+	fopen(DataFile, F_INPUT)
+	  load_DataFile
+	fclose(F_INPUT);
+	forall(s in S) Lmean(s) := round((Lmax(s)+Lmin(s))/2)
+	forall(tau in T, t in T, s in S ) do
+		writeln("t: ",Lmean(s), "dem: ", d(t));
+		if tau < t - Lmean(s) then
+			delta(tau,t,s,1) := 1;
+		else
+			delta(tau,t,s,1) := 0;
+		end-if
+		writeln("tau: ",tau, " t: ",t, " delta: ", delta(tau,t,s,1), " t - Lmean(s) :",  t - Lmean(s)   );
+	end-do
+!	forall(s in S) L(s) := Lmean(s)
+	forall(s in S) L(s) := Lmax(s)
+
+
+BigM := sum(t in T)d(t)	!the maximum that can be delivered by and supplier at any periods
+!The model : ******************************************************************************
+!******************************************************************************************
+TotalCost := C + sum(t in T, s in S)(Y(t,s)*o(s)+Q(t,s)*p(s))
+!Constraint related to holding cost
+forall(t in T, w in W)
+	ConstraintHolding(t,w) := c(t,w) >= h*(sum(tau in 1..t, s in S) delta(tau,t,s,w) * Q(tau,s)-sum(tau in 1..t)d(tau))
+
+forall(t in T, w in W)
+	ConstraintBackorder(t,w) := c(t, w) >= -b*(sum(tau in 1..t, s in S) delta(tau,t,s,w) * Q(tau,s)-sum(tau in 1..t)d(tau))
+
+forall(w in W)
+	ConstraintCostScenario(w) := Cw(w) = sum(t in T)  c(t, w)
+
+forall(w in W)
+	ConstraintWorstCaseCost(w) := C >= Cw(w)
+
+!Constraint link between binary variables Y(t,s) and quantities Q(t,s)
+forall(t in T, s in S)
+	ConstraintBigM(t,s) := Q(t,s) <= BigM*Y(t,s)
+
+forall(t in T, s in S)
+	Constraint_YIntegrality(t,s) := Y(t,s) is_binary
+
+!================================================
+!===  le 3/7/2019
+!     Constraint to insure that all demands are satisfied
+! at the end of the horizon
+!================================================
+Constrain_SatisfyAllDemand := sum(t in T, s in S) Q(t,s) >= sum(t in T) d(t)
+
+!forall(t in T, s in S|s<>7) Y(t,s) = 0
+
+setparam("xprs_verbose", true)
+setparam("XPRS_MIPTHREADS", 1)
+setparam("XPRS_MAXTIME", 600)
+
+
+nr :=0
+ send(EVENT_READY,0)                  ! Model is ready (= running)
+repeat
+
+ wait
+ ev:= getnextevent
+ if getclass(ev) <> EVENT_PRINT then
+	 nr := nr+1
+
+	 if nr >= 2 then
+
+		 initializations from "bin:shmem:soldelta"
+			sol_delta
+		 end-initializations
+
+		ws := nr
+
+	    ConstraintWorstCaseCost2(ws) := C >= Cw(ws)
+
+		forall(t in T)
+			ConstraintHolding2(t,ws) := c(t,ws) >= h*(sum(tau in 1..t, s in S) (sol_delta(tau,t,s) * Q(tau,s))- sum(tau2 in 1..t)d(tau2))
+
+
+		 forall(t in T)
+			ConstraintBackorder2(t,ws) := c(t, ws) >= -b*(sum(tau in 1..t, s in S) sol_delta(tau,t,s) * Q(tau,s) - sum(tau2 in 1..t)d(tau2))
+	 	 ConstraintCostScenario2(ws) := Cw(ws) = sum(t in T)  c(t, ws)
+
+
+	 end-if
+
+	 minimize(TotalCost)
+
+    ! screen_DisplayResults
+	 forall(t in T, s in S) sol_Q(t,s):= getsol(Q(t,s))
+	 initializations to "bin:shmem:sol"
+		   sol_Q
+	 end-initializations
+
+
+	 send(EVENT_SOLVED, getobjval)
+
+	 forall(t in T, s in S) write(sol_Q(t,s), "")
+  end-if
+
+until getclass(ev) =  EVENT_PRINT
+
+
+ screen_DisplayResults
+fopen(ResultFile, F_OUTPUT)
+	writeln("========================================================")
+  save_ResultFile
+fclose(F_OUTPUT);
+
+
+!******************************************************************************************
+!Procedure : ******************************************************************************
+procedure load_DataFile
+	declarations
+		TempString: string
+	end-declarations
+
+	readln(TempString)
+	readln(TempString)
+	forall(s in S) do
+		if (s = Suppliers) then readln(o(s)) ! last entry in the raw, use readln
+		else read(o(s)); end-if
+	end-do
+	readln(TempString)
+	forall(s in S) do
+		if (s=Suppliers) then readln(p(s)) ! last entry in the raw, use readln
+		else read(p(s)); end-if
+	end-do
+	readln(TempString)
+	readln(h)
+	readln(TempString)
+	readln(b)
+	readln(TempString)
+	readln(Imax)
+	readln(TempString)
+	readln(TempString)
+	forall(t in T) do
+		if (t=Periods) then readln(d(t)) ! last entry in the raw, use readln
+		else read(d(t)); end-if
+	end-do
+	readln(TempString)
+	forall(s in S) do
+		if (s=Suppliers) then readln(Lmax(s)) ! last entry in the raw, use readln
+		else read(Lmax(s)); end-if
+	end-do
+	readln(TempString)
+	forall(s in S) do
+		if (s=Suppliers) then readln(Lmin(s)) ! last entry in the raw, use readln
+		else read(Lmin(s)); end-if
+	end-do
+	readln(TempString)
+	read(gamma)
+
+end-procedure	! Load Data File
+
+procedure save_ResultFile
+	writeln("Adversarial ", 9, 0 ) ! getobjval
+	forall(t in T, s in S)
+		if (getsol(Y(t,s)) > 0) then
+			writeln("t: ", t, " s: ",s," Y: ",getsol(Y(t,s)), " Q: ", getsol(Q(t,s)))
+		end-if
+	forall(w in W) do
+		forall(t in T)
+			writeln("c(",t,",",w,"): ", getsol(c(t,w)),
+					" IorB: ", sum(tau in 1..t, s in S) delta(tau,t,s,w) * getsol(Q(tau,s))-sum(tau in 1..t)d(tau))
+		writeln("Holding/Penalty: ", sum(t in T)getsol(c(t,w)))
+	end-do
+
+	writeln("Ordering: ", sum(t in T, s in S)o(s)*getsol(Y(t,s)))
+
+	writeln("Part costs: ", sum(t in T, s in S)p(s)*getsol(Q(t,s)))
+
+end-procedure  !save result file
+
+procedure screen_DisplayResults
+	writeln(getobjval)
+    writeln("Total Holding/Penalty: ", getsol(C))
+	writeln("Ordering: ", sum(t in T, s in S)o(s)*getsol(Y(t,s)))
+
+	writeln("Part costs: ", sum(t in T, s in S)p(s)*getsol(Q(t,s)))
+	forall(t in T, s in S)
+		if (getsol(Y(t,s)) > 0) then
+			writeln("t: ", t, " s: ",s," Y: ",getsol(Y(t,s)), " Q: ", getsol(Q(t,s)))
+		end-if
+	forall(w in W) do
+		forall(t in T)
+			writeln("c(",t,",",w,"): ", getsol(c(t,w)),
+				    " IorB: ", sum(tau in 1..t, s in S) delta(tau,t,s,w) * getsol(Q(tau,s))-sum(tau in 1..t)d(tau))
+		writeln("Holding/Penalty: ", sum(t in T)getsol(c(t, w)))
+	end-do
+	writeln("Ordering: ", sum(t in T, s in S)o(s)*getsol(Y(t,s)))
+end-procedure  !save result file
+
+end-model
