@@ -55,7 +55,7 @@ model "Adversial_Main"
   writeln("Begin running model")
   !...
 
-
+salut
 
 ! Compile + load all mainmodel
  if compile("Adversarial_SupplierSelection.mos")<>0 then exit(1); end-if
